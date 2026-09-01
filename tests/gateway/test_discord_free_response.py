@@ -127,12 +127,26 @@ def adapter(monkeypatch):
     return adapter
 
 
-def make_message(*, channel, content: str, mentions=None, msg_type=None):
+def make_guild_with_bot_roles(bot_user, *role_ids, guild_id: int = 1, guild_name: str = "Hermes Server"):
+    """Build a fake guild whose ``me`` exposes the given bot roles.
+
+    ``_self_role_ids`` reads ``guild.me.roles`` (or ``guild.get_member``),
+    so the returned guild must carry a ``me`` member with those roles.
+    ``guild.id`` is required because ``build_source`` sets ``guild_id`` from it.
+    """
+    roles = [SimpleNamespace(id=role_id) for role_id in role_ids]
+    bot_member = SimpleNamespace(id=bot_user.id, roles=roles)
+    return SimpleNamespace(id=guild_id, name=guild_name, me=bot_member)
+
+
+def make_message(*, channel, content: str, mentions=None, role_mentions=None, guild=None, msg_type=None):
     author = SimpleNamespace(id=42, display_name="Jezza", name="Jezza")
     return SimpleNamespace(
         id=123,
         content=content,
         mentions=list(mentions or []),
+        role_mentions=list(role_mentions or []),
+        guild=guild,
         attachments=[],
         reference=None,
         created_at=datetime.now(timezone.utc),
@@ -225,6 +239,98 @@ async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, mo
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "hello with mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_accepts_and_strips_bot_role_mentions_when_enabled(adapter, monkeypatch):
+    """A mention of a role the bot holds satisfies require_mention when enabled.
+
+    Verifies the role-mention path of ``_self_is_addressed_for_require_mention``
+    and that the ``<@&ROLE_ID>`` token is stripped from the fed text.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION_ROLES", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    bot_user = adapter._client.user
+    bot_role = SimpleNamespace(id=555)
+    guild = make_guild_with_bot_roles(bot_user, bot_role.id)
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content=f"<@&{bot_role.id}> hello with role mention",
+        role_mentions=[bot_role],
+        guild=guild,
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello with role mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_role_mentions_ignored_when_disabled(adapter, monkeypatch):
+    """A role mention does NOT satisfy require_mention unless the opt-in is on."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_REQUIRE_MENTION_ROLES", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    bot_user = adapter._client.user
+    bot_role = SimpleNamespace(id=555)
+    guild = make_guild_with_bot_roles(bot_user, bot_role.id)
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content=f"<@&{bot_role.id}> hello with role mention",
+        role_mentions=[bot_role],
+        guild=guild,
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_user_mention_satisfies_require_mention(adapter, monkeypatch):
+    """A direct user @mention satisfies require_mention regardless of role opt-in."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_REQUIRE_MENTION_ROLES", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content=f"<@{bot_user.id}> hello with mention",
+        mentions=[bot_user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello with mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_no_mention_skips_require_mention_gate(adapter, monkeypatch):
+    """Without any mention the require_mention gate blocks the invocation."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_REQUIRE_MENTION_ROLES", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content="hello without any mention",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
